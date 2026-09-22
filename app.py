@@ -37,8 +37,8 @@ OPENING = "Once upon a time,"   # kept at the front of every story
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_captioner():
-    """Load the pre-trained image-to-text (image captioning) pipeline."""
-    return pipeline("image-to-text", model=CAPTION_MODEL)
+    """Load the pre-trained image-text-to-text (image captioning) pipeline."""
+    return pipeline("image-text-to-text", model=CAPTION_MODEL)
 
 
 @st.cache_resource(show_spinner=False)
@@ -62,7 +62,7 @@ def generate_caption(captioner, image: Image.Image) -> str:
     Produce a short caption describing the content of an uploaded image.
 
     Args:
-        captioner: A Hugging Face image-to-text pipeline.
+        captioner: A Hugging Face image-text-to-text pipeline.
         image: A PIL Image object.
 
     Returns:
