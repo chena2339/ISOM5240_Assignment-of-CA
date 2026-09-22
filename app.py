@@ -1,292 +1,132 @@
-"""
-Storytelling App for Kids (aged 3-10)
-======================================
-An interactive Streamlit application that:
-    1. Accepts an image uploaded by the user.
-    2. Generates a caption using the Hugging Face image-captioning pipeline
-       (Salesforce/blip-image-captioning-base).
-    3. Expands the caption into a 50-100 word children's story using a
-       Hugging Face text-generation pipeline (distilgpt2).
-    4. Converts the story into speech using gTTS and plays it back.
-
-Designed to be deployed on Streamlit Cloud.
-"""
-
-import io
-import re
-
 import streamlit as st
 from PIL import Image
 from transformers import pipeline
 from gtts import gTTS
+import tempfile
+import os
 
+# -------------------------------
+# Load Models (cached to avoid reloading)
+# -------------------------------
+@st.cache_resource
+def load_caption_model():
+    """Load the BLIP image captioning pipeline (auto-detect task)."""
+    # No explicit task parameter – let Hugging Face infer the correct pipeline
+    return pipeline(model="Salesforce/blip-image-captioning-base")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
-STORY_MODEL = "distilgpt2"
-MIN_WORDS = 50      # lower bound of the required story length
-MAX_WORDS = 100     # upper bound of the required story length
-MAX_RETRIES = 3     # retries if the first story is too short
-OPENING = "Once upon a time,"   # kept at the front of every story
+@st.cache_resource
+def load_story_model():
+    """Load a text generation pipeline (GPT-2) for story expansion."""
+    return pipeline("text-generation", model="gpt2")
 
-
-# ---------------------------------------------------------------------------
-# Model loading (cached so models are downloaded/loaded only once per session)
-# ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def load_captioner():
-    """Load the pre-trained image-text-to-text (image captioning) pipeline."""
-    return pipeline("image-text-to-text", model=CAPTION_MODEL)
-
-
-@st.cache_resource(show_spinner=False)
-def load_story_generator():
-    """Load the pre-trained text-generation pipeline."""
-    return pipeline("text-generation", model=STORY_MODEL)
-
-
-# ---------------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------------
-def clean_caption(raw: str) -> str:
-    """Normalise a raw BLIP caption: strip whitespace and trailing punctuation."""
-    caption = raw.strip()
-    caption = caption.rstrip(".!? ").strip()
-    return caption
-
-
-def generate_caption(captioner, image: Image.Image) -> str:
+# -------------------------------
+# Core Functions
+# -------------------------------
+def generate_caption(image: Image.Image, caption_pipe) -> str:
     """
-    Produce a short caption describing the content of an uploaded image.
-
-    Args:
-        captioner: A Hugging Face image-text-to-text pipeline.
-        image: A PIL Image object.
-
-    Returns:
-        A cleaned caption string, e.g. "a dog running in the park".
+    Generate a caption for the given image using the captioning pipeline.
+    Ensures the image is in RGB mode before passing to the model.
+    Returns a string description.
     """
-    outputs = captioner(image.convert("RGB"))
-    return clean_caption(outputs[0]["generated_text"])
+    result = caption_pipe(image.convert("RGB"))
+    # BLIP returns a list of dicts; take the first generated text
+    caption = result[0]["generated_text"]
+    return caption.strip()
 
-
-def _split_sentences(text: str):
+def generate_story(caption: str, story_pipe, max_length=150) -> str:
     """
-    Split text into sentences robustly.
-
-    GPT-2 occasionally emits sentences stuck together without a space,
-    e.g. "in the park.Then a dog ran over". We insert a space after a
-    sentence-ending punctuation mark when it is immediately followed by an
-    uppercase letter, then split on punctuation + whitespace.
+    Expand the caption into a short story (50-100 words).
+    Uses GPT-2 with a prompt tailored for children.
     """
-    text = re.sub(r"(?<=[.!?])(?=[A-Z0-9])", " ", text)
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _assemble_story(completion: str):
-    """
-    Build a story that starts with OPENING and contains between MIN_WORDS and
-    MAX_WORDS words.
-
-    Strategy:
-        1. Greedily add whole sentences until MIN_WORDS is reached (the floor
-           is the harder requirement when sentences are chunky).
-        2. Once the floor is met, keep adding sentences only while the total
-           stays at or below MAX_WORDS.
-        3. As a final safety net, hard-trim at MAX_WORDS words, preferring to
-           stop at the last complete sentence.
-
-    Returns:
-        (story_text, word_count)
-    """
-    sentences = _split_sentences(completion)
-    opening_words = len(OPENING.split())
-
-    chosen = []
-    word_count = opening_words
-    for sent in sentences:
-        sw = len(sent.split())
-        # Floor not reached yet -> keep going even if this sentence pushes
-        # close to the ceiling (a final hard trim will correct it).
-        if word_count >= MIN_WORDS and word_count + sw > MAX_WORDS:
-            break
-        chosen.append(sent)
-        word_count += sw
-
-    story = f"{OPENING} {' '.join(chosen)}".strip()
-
-    # Hard ceiling: if a single chunky sentence pushed us over MAX_WORDS,
-    # trim at the last complete sentence within the budget.
-    words = story.split()
-    if len(words) > MAX_WORDS:
-        trimmed = words[:MAX_WORDS]
-        for i in range(len(trimmed) - 1, -1, -1):
-            if trimmed[i].endswith((".", "!", "?")):
-                trimmed = trimmed[: i + 1]
-                break
-        story = " ".join(trimmed)
-        word_count = len(trimmed)
-    else:
-        word_count = len(words)
-
-    # Note: the continuation is intentionally left as-is after the comma in
-    # OPENING ("Once upon a time, a little dog..."); lower-case there is
-    # grammatically correct.
-    return story, word_count
-
-
-def generate_story(generator, caption: str) -> str:
-    """
-    Expand an image caption into a 50-100 word, child-friendly story.
-
-    If the first generation lands outside the word range, retry with a
-    slightly higher temperature; use the best result either way.
-
-    Args:
-        generator: A Hugging Face text-generation pipeline.
-        caption: A cleaned caption string.
-
-    Returns:
-        A 50-100 word story as a string.
-    """
-    clean = clean_caption(caption)
     prompt = (
-        "A short, warm children's picture-book story about "
-        f"{clean}. {OPENING} "
+        f"Once upon a time, there was a scene: {caption}. "
+        "Tell a short and fun story for kids about what happens next."
     )
-
-    best_story, best_wc = "", 0
-    for attempt in range(MAX_RETRIES):
-        result = generator(
+    result = story_pipe(
+        prompt,
+        max_length=max_length,
+        do_sample=True,
+        temperature=0.8,
+        top_k=50,
+        truncation=True
+    )
+    full_text = result[0]["generated_text"]
+    # Remove the original prompt from the output
+    story = full_text[len(prompt):].strip()
+    # Ensure story ends properly; keep roughly 3 sentences
+    sentences = story.split(".")
+    short_story = ".".join(sentences[:3]) + "."
+    # Word count check: aim for 50-100 words
+    words = short_story.split()
+    if len(words) > 110:
+        short_story = " ".join(words[:100]) + "..."
+    elif len(words) < 20:
+        # Fallback: try again with higher temperature
+        result2 = story_pipe(
             prompt,
-            max_new_tokens=140,
+            max_length=200,
             do_sample=True,
-            top_k=50,
+            temperature=0.9,
             top_p=0.95,
-            temperature=0.7 + attempt * 0.1,
-            no_repeat_ngram_size=2,
-            pad_token_id=generator.tokenizer.eos_token_id,
+            truncation=True
         )
-        # Remove the prompt (including its trailing OPENING) from the output;
-        # OPENING is re-attached by _assemble_story so the story reads
-        # cleanly from a complete phrase.
-        completion = result[0]["generated_text"][len(prompt):]
-        story, wc = _assemble_story(completion)
+        short_story = result2[0]["generated_text"][len(prompt):].strip()
+        short_story = ".".join(short_story.split(".")[:3]) + "."
+    return short_story
 
-        if MIN_WORDS <= wc <= MAX_WORDS:
-            return story
-        # Track the closest valid-length result as a fallback.
-        if best_story == "" or abs(wc - 75) < abs(best_wc - 75):
-            best_story, best_wc = story, wc
-
-    return best_story
-
-
-def text_to_speech(text: str) -> io.BytesIO:
+def text_to_speech(text: str) -> str:
     """
-    Convert a piece of text into MP3 audio using gTTS.
-
-    The audio is kept in memory (BytesIO) so no temporary files are leaked
-    to disk between Streamlit reruns.
-
-    Args:
-        text: The story to be read aloud.
-
-    Returns:
-        A BytesIO buffer positioned at the start, ready for st.audio().
+    Convert text to speech using gTTS and save to a temporary MP3 file.
+    Returns the path to the audio file.
     """
-    tts = gTTS(text=text, lang="en", slow=False)
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)
-    return buf
+    tts = gTTS(text=text, lang="en")
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tts.save(tmp_file.name)
+    return tmp_file.name
 
+# -------------------------------
+# Streamlit App UI
+# -------------------------------
+def main():
+    st.set_page_config(page_title="Kids Storyteller 🧸", layout="centered")
+    st.title("📖 Storytelling App for Kids (3-10 years)")
+    st.markdown("Upload an image and I'll tell you a magical story!")
 
-# ---------------------------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------------------------
-def set_page_style() -> None:
-    """Inject a few simple CSS tweaks to make the UI feel child-friendly."""
-    st.markdown(
-        """
-        <style>
-        .main .block-container { padding-top: 2rem; }
-        h1 { color: #ff6b6b; text-align: center; }
-        .story-box {
-            background-color: #fff8e7;
-            border-left: 6px solid #ffb703;
-            padding: 16px;
-            border-radius: 8px;
-            font-size: 18px;
-            line-height: 1.6;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Load models once
+    with st.spinner("Loading AI models... this may take a minute ⏳"):
+        caption_pipe = load_caption_model()
+        story_pipe = load_story_model()
 
-
-def main() -> None:
-    st.set_page_config(
-        page_title="Storytime with Doubao",
-        page_icon="📚",
-        layout="centered",
-    )
-    set_page_style()
-
-    st.title("📚 Storytime!")
-    st.write(
-        "Upload a picture and I will turn it into a magical story "
-        "just for you! 🌈✨"
-    )
-
-    uploaded_file = st.file_uploader(
-        "Choose a picture (a drawing, a photo, anything!)",
-        type=["png", "jpg", "jpeg"],
-    )
+    # File uploader
+    uploaded_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
 
     if uploaded_file is not None:
+        # Display the uploaded image
         image = Image.open(uploaded_file)
         st.image(image, caption="Your picture", use_container_width=True)
 
-        if st.button("📖 Tell me a story!", type="primary"):
-            with st.spinner("Looking at your picture... 🖼️"):
-                try:
-                    captioner = load_captioner()
-                    caption = generate_caption(captioner, image)
-                except Exception as exc:  # pragma: no cover - runtime guard
-                    st.error(f"Sorry, I couldn't read that picture: {exc}")
-                    return
+        # Generate story button
+        if st.button("✨ Tell me a story!"):
+            with st.spinner("Looking at your picture..."):
+                caption = generate_caption(image, caption_pipe)
+                st.info(f"I see: {caption}")
 
-            with st.spinner("Writing your story... ✍️"):
-                try:
-                    generator = load_story_generator()
-                    story = generate_story(generator, caption)
-                except Exception as exc:  # pragma: no cover - runtime guard
-                    st.error(f"Oops, something went wrong: {exc}")
-                    return
+            with st.spinner("Creating a story..."):
+                story = generate_story(caption, story_pipe)
+                st.success("Here's your story!")
+                st.write(story)
 
-            st.subheader("Here is your story:")
-            st.markdown(
-                f'<div class="story-box">{story}</div>',
-                unsafe_allow_html=True,
-            )
-            st.caption(f"*About {len(story.split())} words.*")
-
-            with st.spinner("Reading it out loud... 🔊"):
-                try:
-                    audio_buf = text_to_speech(story)
-                    st.audio(audio_buf, format="audio/mp3")
-                except Exception as exc:  # pragma: no cover - runtime guard
-                    st.warning(f"I couldn't read the story out loud: {exc}")
-
-    st.markdown("---")
-    st.caption("Made with ❤️ for curious kids aged 3-10.")
-
+            with st.spinner("Converting to speech..."):
+                audio_path = text_to_speech(story)
+                st.audio(audio_path, format="audio/mp3")
+                st.download_button(
+                    label="Download Audio",
+                    data=open(audio_path, "rb"),
+                    file_name="story.mp3",
+                    mime="audio/mp3"
+                )
+                # Clean up temporary file
+                os.unlink(audio_path)
 
 if __name__ == "__main__":
     main()
-#（注：内容由AI生成）
