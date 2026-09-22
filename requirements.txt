@@ -1,5 +1,6 @@
-streamlit>=1.30
-transformers>=4.40
+streamlit
+transformers
 torch
 pillow
-gTTS
+gtts
+sentencepiece
