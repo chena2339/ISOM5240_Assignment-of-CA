@@ -25,7 +25,6 @@ from gtts import gTTS
 # Constants
 # ---------------------------------------------------------------------------
 CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
-# TinyStories is a specialized model for 3-10 yo kids stories (Fast & Coherent)
 STORY_MODEL = "roneneldan/TinyStories-33M"
 MIN_WORDS = 50      # Lower bound of required story word count
 MAX_WORDS = 100     # Upper bound of required story word count
@@ -74,65 +73,56 @@ def generate_caption(captioner, image: Image.Image) -> str:
 
 def _split_sentences(text: str):
     """
-    Split completion text into sentences robustly.
+    Split completion text into clean, complete sentences robustly.
     Inserts a space after sentence enders followed by uppercase letters.
     """
     text = re.sub(r"(?<=[.!?])(?=[A-Z0-9])", " ", text)
     parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+    # Only keep complete sentences that end with punctuation
+    valid_sentences = []
+    for p in parts:
+        p_str = p.strip()
+        if p_str and p_str[-1] in [".", "!", "?"]:
+            valid_sentences.append(p_str)
+    return valid_sentences
 
 
 def _assemble_story(completion: str, opening_phrase: str):
     """
     Build a story starting with opening_phrase that strictly meets 50-100 word limits.
 
-    Fixes:
-      - Accurately includes opening_phrase word count into total budget.
-      - Ensures the story retains 'Once upon a time...' at the beginning.
-
-    Returns:
-        Tuple of (story_text, word_count)
+    Ensures 100% complete sentences without mid-sentence cutoffs.
     """
     sentences = _split_sentences(completion)
     opening_words = len(opening_phrase.split())
 
     chosen = []
     word_count = opening_words
+    
     for sent in sentences:
         sw = len(sent.split())
-        if word_count >= MIN_WORDS and word_count + sw > MAX_WORDS:
+        # Strictly stop adding sentences BEFORE exceeding MAX_WORDS ceiling
+        if word_count + sw > MAX_WORDS:
             break
         chosen.append(sent)
         word_count += sw
 
-    # Re-attach the opening phrase properly
+    # Assemble only fully completed sentences
     story = f"{opening_phrase} {' '.join(chosen)}".strip()
+    
+    # Backup safety: if no additional complete sentence fitted, ensure opening_phrase ends cleanly
+    if not story.endswith((".", "!", "?")):
+        story += "."
 
-    # Hard ceiling check: trim at last complete sentence within budget
-    words = story.split()
-    if len(words) > MAX_WORDS:
-        trimmed = words[:MAX_WORDS]
-        for i in range(len(trimmed) - 1, -1, -1):
-            if trimmed[i].endswith((".", "!", "?")):
-                trimmed = trimmed[: i + 1]
-                break
-        story = " ".join(trimmed)
-        word_count = len(trimmed)
-    else:
-        word_count = len(words)
-
-    return story, word_count
+    return story, len(story.split())
 
 
 def generate_story(generator, caption: str) -> str:
     """
-    Expand an image caption into a logical 50-100 word children's story.
-
-    Uses TinyStories-33M to guarantee child-friendly, hallucination-free generation.
+    Expand an image caption into a logical 50-100 word children's story with complete sentences.
     """
     clean = clean_caption(caption)
     
-    # Define opening phrase explicitly and guide the story line
     opening_phrase = f"Once upon a time, there was {clean}."
     prompt = f"{opening_phrase} One sunny day, they decided to go on an adventure."
 
@@ -140,19 +130,19 @@ def generate_story(generator, caption: str) -> str:
     for attempt in range(MAX_RETRIES):
         result = generator(
             prompt,
-            max_new_tokens=120,   # Optimal token budget
+            max_new_tokens=140,   # Increased token limit to allow sentence completion
             do_sample=True,
-            top_k=25,             # Focused top_k
-            top_p=0.85,           # Focused top_p
-            temperature=0.4 + attempt * 0.1,  # Low temperature prevents off-topic rambling
+            top_k=25,
+            top_p=0.85,
+            temperature=0.4 + attempt * 0.1,
             no_repeat_ngram_size=2,
             pad_token_id=generator.tokenizer.eos_token_id,
         )
 
-        # Extract only generated completion text
+        # Extract generated completion text
         completion = result[0]["generated_text"][len(prompt):]
         
-        # Assemble story by passing the original opening_phrase
+        # Assemble story using only full, complete sentences
         story, wc = _assemble_story(completion, opening_phrase=opening_phrase)
 
         if MIN_WORDS <= wc <= MAX_WORDS:
@@ -164,9 +154,7 @@ def generate_story(generator, caption: str) -> str:
 
 
 def text_to_speech(text: str) -> io.BytesIO:
-    """
-    Convert text into MP3 audio using gTTS in memory.
-    """
+    """Convert text into MP3 audio using gTTS in memory."""
     tts = gTTS(text=text, lang="en", slow=False)
     buf = io.BytesIO()
     tts.write_to_fp(buf)
@@ -175,7 +163,7 @@ def text_to_speech(text: str) -> io.BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# Streamlit Interface (Lightweight layout for fast rendering)
+# Streamlit Interface
 # ---------------------------------------------------------------------------
 def main() -> None:
     st.set_page_config(
