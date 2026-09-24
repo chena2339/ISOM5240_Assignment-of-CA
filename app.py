@@ -74,9 +74,10 @@ def generate_caption(captioner, image: Image.Image) -> str:
 def _split_sentences(text: str):
     """
     Split completion text into clean, complete sentences robustly.
-    Inserts a space after sentence enders followed by uppercase letters.
+    Insert a space after ANY sentence ender followed directly by another
+    character (small models often omit the space, e.g. "sat.They saw...").
     """
-    text = re.sub(r"(?<=[.!?])(?=[A-Z0-9])", " ", text)
+    text = re.sub(r"(?<=[.!?])(?=\S)", " ", text)
     parts = re.split(r"(?<=[.!?])\s+", text)
     # Only keep complete sentences that end with punctuation
     valid_sentences = []
@@ -91,14 +92,16 @@ def _assemble_story(completion: str, opening_phrase: str):
     """
     Build a story starting with opening_phrase that strictly meets 50-100 word limits.
 
-    Ensures 100% complete sentences without mid-sentence cutoffs.
+    Strategy: greedily add COMPLETE sentences until the next one would exceed
+    MAX_WORDS. Fallbacks guarantee the word-count requirement is met even if
+    the model produces unpunctuated text or very short output.
     """
     sentences = _split_sentences(completion)
     opening_words = len(opening_phrase.split())
 
     chosen = []
     word_count = opening_words
-    
+
     for sent in sentences:
         sw = len(sent.split())
         # Strictly stop adding sentences BEFORE exceeding MAX_WORDS ceiling
@@ -107,10 +110,29 @@ def _assemble_story(completion: str, opening_phrase: str):
         chosen.append(sent)
         word_count += sw
 
-    # Assemble only fully completed sentences
+    # Fallback 1: if sentence splitting failed entirely (e.g. the model
+    # produced one long unpunctuated stream), at least keep the first
+    # sentence-shaped chunk so the story is not only the opening phrase.
+    if not chosen and sentences:
+        first = sentences[0]
+        chosen.append(first)
+        word_count += len(first.split())
+
     story = f"{opening_phrase} {' '.join(chosen)}".strip()
-    
-    # Backup safety: if no additional complete sentence fitted, ensure opening_phrase ends cleanly
+
+    # Fallback 2: if complete sentences alone cannot reach MIN_WORDS,
+    # pad from the raw completion text (word-level, avoid reusing the
+    # words already consumed by `chosen`).
+    if word_count < MIN_WORDS:
+        all_words = completion.split()
+        already_used = sum(len(s.split()) for s in chosen)
+        need = MIN_WORDS - word_count
+        padding = " ".join(all_words[already_used:already_used + need])
+        if padding:
+            story = f"{story} {padding}"
+            word_count += len(padding.split())
+
+    # Backup safety: ensure the story ends cleanly with punctuation
     if not story.endswith((".", "!", "?")):
         story += "."
 
@@ -122,9 +144,11 @@ def generate_story(generator, caption: str) -> str:
     Expand an image caption into a logical 50-100 word children's story with complete sentences.
     """
     clean = clean_caption(caption)
-    
+
     opening_phrase = f"Once upon a time, there was {clean}."
-    prompt = f"{opening_phrase} One sunny day, they decided to go on an adventure."
+    # NOTE: avoid "they" - the caption may describe an object (e.g. a car),
+    # so use a neutral opening that introduces the adventure instead.
+    prompt = f"{opening_phrase} One sunny day, an exciting adventure began."
 
     best_story, best_wc = "", 0
     for attempt in range(MAX_RETRIES):
@@ -141,7 +165,7 @@ def generate_story(generator, caption: str) -> str:
 
         # Extract generated completion text
         completion = result[0]["generated_text"][len(prompt):]
-        
+
         # Assemble story using only full, complete sentences
         story, wc = _assemble_story(completion, opening_phrase=opening_phrase)
 
